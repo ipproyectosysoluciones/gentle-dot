@@ -136,6 +136,8 @@ async function setup(
 		credentials?: (id: string) => Promise<UpstreamCredentials>;
 		upstream?: ReturnType<typeof memoryUpstream>;
 		inMemory?: boolean;
+		transport?: () => McpTransport;
+		connectRetry?: { attempts: number; delaysMs: number[] };
 	} = {},
 ) {
 	const views = new Map((options.connectors ?? [connector()]).map((c) => [c.id, c]));
@@ -149,7 +151,8 @@ async function setup(
 			previews.push(preview);
 			return options.approve ? options.approve(preview) : true;
 		},
-		...(options.inMemory === false ? {} : { transport: upstream.transport }),
+		...(options.inMemory === false ? {} : { transport: options.transport ?? upstream.transport }),
+		...(options.connectRetry ? { connectRetry: options.connectRetry } : {}),
 		env: process.env,
 		cwd: tempDir(),
 		log: (line) => logs.push(line),
@@ -366,6 +369,58 @@ describe("MCP proxy: policy from the live connector state", () => {
 });
 
 describe("MCP proxy: upstream connections", () => {
+	/** A transport whose server process dies during boot the first `failures` times, then starts. */
+	function flakyTransport(failures: number) {
+		const state = { attempts: 0 };
+		const good = memoryUpstream();
+		let left = failures;
+		const transport = (): McpTransport => {
+			state.attempts++;
+			if (left > 0) {
+				left--;
+				return {
+					start: () => Promise.reject(new Error("the server process exited while booting")),
+					send: () => Promise.reject(new Error("dead")),
+					close: () => Promise.resolve(),
+					onMessage: () => () => {},
+					onError: () => () => {},
+					onClose: () => () => {},
+				};
+			}
+			return good.transport();
+		};
+		return { transport, state };
+	}
+
+	it("retries a connector whose server does not come up on the first boot, then answers", async () => {
+		const flaky = flakyTransport(2);
+		const { open, logs } = await setup({
+			transport: flaky.transport,
+			connectRetry: { attempts: 3, delaysMs: [1, 1] },
+		});
+		const client = await open();
+		expect((await client.listTools()).map((t) => t.name)).toContain("search");
+		expect(flaky.state.attempts).toBe(3);
+		expect(logs.join("\n")).toMatch(/connector notes did not come up/);
+		expect(logs.join("\n")).toMatch(/retrying/);
+	});
+
+	it("gives up after the bounded retries and still recovers on the next request", async () => {
+		const flaky = flakyTransport(2);
+		const { open, logs } = await setup({
+			transport: flaky.transport,
+			connectRetry: { attempts: 2, delaysMs: [1] },
+		});
+		const client = await open();
+		const failed = await rpcError(client.listTools());
+		expect(failed.message).toMatch(/could not reach Notes/i);
+		expect(flaky.state.attempts).toBe(2);
+		// The next request starts over: the upstream is not left dead for the session.
+		expect((await client.listTools()).map((t) => t.name)).toContain("search");
+		expect(flaky.state.attempts).toBe(3);
+		expect(logs.join("\n")).toMatch(/retrying/);
+	});
+
 	it("passes the upstream's errors on, and reconnects after the upstream dropped", async () => {
 		const { open, upstream, logs } = await setup();
 		const client = await open();

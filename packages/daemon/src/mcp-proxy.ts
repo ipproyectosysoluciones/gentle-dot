@@ -82,6 +82,8 @@ export interface McpProxyOptions {
 	approve(preview: ApprovalPreview, signal: AbortSignal): Promise<boolean>;
 	/** The transport to the real server; by default streamable HTTP or stdio, from the server. */
 	transport?: (connector: ProxiedConnector, credentials: UpstreamCredentials) => McpTransport;
+	/** Connect retries while a server boots (tests pass a tighter one). Default CONNECT_RETRY. */
+	connectRetry?: { attempts: number; delaysMs: number[] };
 	/** The environment stdio servers start from (the engine's own), and their working folder. */
 	env?: NodeJS.ProcessEnv;
 	cwd?: string;
@@ -109,6 +111,12 @@ const MAX_BODY = 8 * 1024 * 1024;
 /** A tool call may wait for the user's approval and then the server: just under the engine's 300 s. */
 const CALL_TIMEOUT_MS = 290_000;
 const REQUEST_TIMEOUT_MS = 60_000;
+/**
+ * Booting a connector with a cold `npx` cache takes tens of seconds, and a boot that misses the
+ * request budget kills the fresh upstream at once. Give the boot a few tries with a short wait
+ * between them: after the first attempt the cache is warm and the retry comes up in seconds.
+ */
+const CONNECT_RETRY = { attempts: 3, delaysMs: [1_000, 5_000] };
 
 interface Upstream {
 	client: McpClient;
@@ -126,9 +134,15 @@ export class McpProxy {
 	/** Requests being answered, by connector and request id, so a `notifications/cancelled` stops them. */
 	private readonly running = new Map<string, AbortController>();
 	private readonly options: McpProxyOptions;
+	private connectRetry = CONNECT_RETRY;
 
 	constructor(options: McpProxyOptions) {
 		this.options = options;
+		if (options.connectRetry) this.connectRetry = options.connectRetry;
+	}
+
+	private sleep(ms: number): Promise<void> {
+		return new Promise((done) => setTimeout(done, ms));
 	}
 
 	/** A fresh key for the next engine launch; the previous one stops working at once. */
@@ -358,22 +372,53 @@ export class McpProxy {
 			upstream = undefined;
 		}
 		if (!upstream) {
-			const client = new McpClient({
-				name: "gentle-dot",
-				version: "1.0.0",
-				requestTimeoutMs: REQUEST_TIMEOUT_MS,
-			});
-			const created: Upstream = {
-				client,
+			// Definite assignment: `connecting` starts with an await, so it only touches `created`
+			// (swapping `.client` between retries) after this literal has been assigned to it.
+			let created!: Upstream;
+			created = {
+				client: new McpClient({
+					name: "gentle-dot",
+					version: "1.0.0",
+					requestTimeoutMs: REQUEST_TIMEOUT_MS,
+				}),
 				revision: connector.revision,
 				connecting: (async () => {
 					const credentials = await this.options.credentials(connector.id);
-					await client.connect(this.transport(connector, credentials));
+					let lastError: unknown;
+					for (let attempt = 0; attempt < this.connectRetry.attempts; attempt++) {
+						const client = new McpClient({
+							name: "gentle-dot",
+							version: "1.0.0",
+							requestTimeoutMs: REQUEST_TIMEOUT_MS,
+						});
+						created.client = client;
+						client.onClose(() => {
+							if (this.upstreams.get(connector.id) === created) this.upstreams.delete(connector.id);
+						});
+						try {
+							await client.connect(this.transport(connector, credentials));
+							return;
+						} catch (error) {
+							lastError = error;
+							// A refused sign-in is not a slow boot: ask the user again, right away.
+							if (
+								error instanceof McpOAuthAuthorizationRequiredError ||
+								error instanceof McpAuthRequiredError
+							)
+								break;
+							await client.close().catch(() => {});
+							const delay = this.connectRetry.delaysMs[attempt];
+							if (delay === undefined) break;
+							const detail = ((error as Error)?.message ?? String(error)).slice(0, 120);
+							this.log(
+								`connector ${connector.id} did not come up (${detail}); retrying in ${Math.round(delay / 1000)}s`,
+							);
+							await this.sleep(delay);
+						}
+					}
+					throw lastError;
 				})(),
 			};
-			client.onClose(() => {
-				if (this.upstreams.get(connector.id) === created) this.upstreams.delete(connector.id);
-			});
 			this.upstreams.set(connector.id, created);
 			upstream = created;
 		}
