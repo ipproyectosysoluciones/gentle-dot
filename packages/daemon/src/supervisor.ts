@@ -22,7 +22,8 @@ export type SupervisorState = "stopped" | "starting" | "ready" | "restarting";
 export type SupervisorEvent =
 	| AgentRecord
 	| { type: "supervisor_state"; state: SupervisorState }
-	| { type: "interrupted" };
+	| { type: "interrupted" }
+	| { type: "turn_timeout"; timeoutMs: number };
 
 export interface SupervisorOptions {
 	/** Executable to run, for example `gentle-shell`. */
@@ -47,6 +48,8 @@ export interface SupervisorOptions {
 	requestTimeoutMs?: number;
 	/** Deadline for the agent to answer its first `get_state`. Default 60s. */
 	startTimeoutMs?: number;
+	/** Deadline for a turn to complete. Default 10 minutes. */
+	turnTimeoutMs?: number;
 	/** Grace period after closing stdin before SIGTERM. Default 5s. */
 	stopTimeoutMs?: number;
 	log?: (line: string) => void;
@@ -86,6 +89,15 @@ export class AgentSupervisor {
 	private restarting = false;
 	private interrupted = false;
 	private restartTimer: NodeJS.Timeout | undefined;
+	/** Timer for turn timeout. */
+	private turnTimeoutTimer: NodeJS.Timeout | undefined;
+	/** The spawn whose engine has not answered yet, while there is one. */
+	private initializing: Promise<void> | undefined;
+	/** A restart asked while an engine starts, run once that start settles. */
+	private queuedRestart: Promise<void> | undefined;
+	/** A restart closing the old process; the engine it starts next comes after any request made meanwhile. */
+	private replacing: Promise<void> | undefined;
+	private wasLaunched = false;
 	private closeWaiters: (() => void)[] = [];
 	/** For a session started by rotation, the session files it continues, oldest first. */
 	private chains: Record<string, string[]> = {};
@@ -98,6 +110,11 @@ export class AgentSupervisor {
 		this.sessionDir = join(options.dataDir, "sessions");
 		this.stateFile = join(options.dataDir, "state.json");
 		this.sessionFile = this.readPersistedSession();
+	}
+
+	/** Whether `start()` or `stop()` was called: before that, `stopped` only means not started yet. */
+	get launched(): boolean {
+		return this.wasLaunched;
 	}
 
 	get pid(): number | undefined {
@@ -123,9 +140,10 @@ export class AgentSupervisor {
 	/** Spawns the agent and resolves once it answered `get_state`. */
 	async start(): Promise<void> {
 		this.stopping = false;
+		this.wasLaunched = true;
 		mkdirSync(this.sessionDir, { recursive: true });
 		this.setState("starting");
-		await this.spawnAndInitialize();
+		await this.initialize();
 	}
 
 	/** Sends a command and resolves with its successful response. */
@@ -157,8 +175,29 @@ export class AgentSupervisor {
 	/**
 	 * Replaces the agent process on purpose (for example after new credentials),
 	 * reopening the same conversation. Not reported as an interruption.
+	 * An engine still starting is not cut off: it is replaced once that start settles,
+	 * once for any number of requests made meanwhile.
 	 */
-	async restart(): Promise<void> {
+	restart(): Promise<void> {
+		if (this.stopping) return Promise.resolve();
+		if (this.initializing) {
+			this.queuedRestart ??= this.initializing
+				.catch(() => {})
+				.then(() => {
+					this.queuedRestart = undefined;
+					return this.restart();
+				});
+			return this.queuedRestart;
+		}
+		if (this.replacing) return this.replacing;
+		const replacing = this.replace().finally(() => {
+			if (this.replacing === replacing) this.replacing = undefined;
+		});
+		this.replacing = replacing;
+		return replacing;
+	}
+
+	private async replace(): Promise<void> {
 		const child = this.child;
 		if (!child || this.stopping) return;
 		this.restarting = true;
@@ -173,11 +212,13 @@ export class AgentSupervisor {
 			return;
 		}
 		this.setState("restarting");
-		await this.spawnAndInitialize();
+		this.replacing = undefined;
+		await this.initialize();
 	}
 
 	async stop(): Promise<void> {
 		this.stopping = true;
+		this.wasLaunched = true;
 		clearTimeout(this.restartTimer);
 		const child = this.child;
 		if (!child) {
@@ -191,6 +232,14 @@ export class AgentSupervisor {
 		await closed;
 		clearTimeout(term);
 		clearTimeout(kill);
+	}
+
+	private initialize(): Promise<void> {
+		const run = this.spawnAndInitialize().finally(() => {
+			if (this.initializing === run) this.initializing = undefined;
+		});
+		this.initializing = run;
+		return run;
 	}
 
 	private async spawnAndInitialize(): Promise<void> {
@@ -262,18 +311,43 @@ export class AgentSupervisor {
 			else pending.reject(new Error(response.error ?? `${response.command} failed`));
 			return;
 		}
-		if (record.type === "agent_start") this.busy = true;
+		if (record.type === "agent_start") {
+			this.busy = true;
+			this.startTurnTimeout();
+		}
 		if (record.type === "agent_settled") {
 			this.settledRuns += 1;
+			this.clearTurnTimeout();
 			this.busy = false;
 			void this.refreshSession().catch(() => {});
 		}
 		this.emit(record);
 	}
 
+	private startTurnTimeout(): void {
+		if (!this.options.turnTimeoutMs) return;
+		this.clearTurnTimeout();
+		this.turnTimeoutTimer = setTimeout(() => {
+			this.clearTurnTimeout();
+			if (this.busy && this.child?.stdin?.writable) {
+				this.emit({ type: "turn_timeout", timeoutMs: this.options.turnTimeoutMs! });
+				this.busy = false;
+				this.child.kill("SIGTERM");
+			}
+		}, this.options.turnTimeoutMs);
+	}
+
+	private clearTurnTimeout(): void {
+		if (this.turnTimeoutTimer) {
+			clearTimeout(this.turnTimeoutTimer);
+			this.turnTimeoutTimer = undefined;
+		}
+	}
+
 	private handleClose(child: ChildProcess, code: number | null, signal: NodeJS.Signals | null): void {
 		if (child !== this.child) return;
 		this.child = undefined;
+		this.clearTurnTimeout();
 		const reason = new Error(`Agent exited (${signal ?? `code ${code}`})`);
 		for (const [id, pending] of this.pending) {
 			clearTimeout(pending.timer);
@@ -305,7 +379,7 @@ export class AgentSupervisor {
 		this.setState("restarting");
 		this.restartTimer = setTimeout(() => {
 			if (this.stopping) return;
-			this.spawnAndInitialize().catch((error: Error) => {
+			this.initialize().catch((error: Error) => {
 				this.log(`agent restart failed: ${error.message}`);
 				// A child that is still alive will close and schedule the next attempt.
 				if (!this.child && !this.stopping) this.scheduleRestart();

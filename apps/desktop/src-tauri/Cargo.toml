@@ -4,6 +4,7 @@ version = "0.1.0"
 description = "Gentle Dot desktop shell"
 edition = "2021"
 publish = false
+rust-version = "1.99"
 
 [lib]
 name = "gentle_dot_lib"
@@ -35,6 +36,13 @@ ureq = { version = "2.12", default-features = false, features = ["tls", "proxy-f
 sha2 = "0.10"
 tar = { version = "0.4", default-features = false }
 bzip2 = "0.6"
+
+# Private daemon transport/lifecycle (T1); pinned to the version already in Cargo.lock.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "=0.61.2", features = ["Win32_Foundation", "Win32_Globalization", "Win32_Security", "Win32_Security_Authorization", "Win32_Security_Cryptography", "Win32_UI_Shell", "Win32_System_Com", "Win32_System_Diagnostics_ToolHelp", "Win32_Storage_FileSystem", "Win32_System_Pipes", "Win32_System_Threading", "Win32_System_JobObjects", "Win32_System_IO", "Win32_System_Registry", "Win32_UI_Controls", "Win32_Graphics_Dwm", "Win32_Graphics_Gdi", "Win32_UI_HiDpi", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_WindowsAndMessaging"] }
+# Voice capture through WASAPI and computer control through UI Automation and shell links (COM interfaces
+# windows-sys does not bind); the version Tauri already uses.
+windows = { version = "=0.62.2", features = ["Win32_Media_Audio", "Win32_System_Com", "Win32_System_Com_StructuredStorage", "Win32_Storage_FileSystem", "Win32_System_Variant", "Win32_UI_Accessibility", "Win32_UI_Shell"] }
 
 # The computer-control helper (S24) is macOS only.
 [target.'cfg(target_os = "macos")'.dependencies]
@@ -86,3 +94,11 @@ opt-level = 3
 
 [profile.dev.package.sha2]
 opt-level = 3
+
+# Prevent cargo from stripping build-dependencies (proc-macros) in release mode.
+# Required for macOS 27+ (Xcode 27) with Rust < 1.99: stripping proc-macro dylibs
+# mis-aligns the LINKEDIT string pool, causing dyld to reject the dylibs.
+# With Rust 1.99+ this is no longer needed, but keeping it as a safeguard.
+# See: #53 macOS 27 / Xcode 27 proc-macro strip issue
+[profile.release.build-override]
+strip = false

@@ -120,7 +120,7 @@ type PendingAsk = {
 	timer?: NodeJS.Timeout;
 };
 const REMEMBERED_REQUEST_IDS = 500;
-const READY_TIMEOUT_MS = 60_000;
+const READY_TIMEOUT_MS = Number(process.env.GENTLE_DOT_READY_TIMEOUT_MS) || 180_000;
 const ANSWER_FAILED = "Something went wrong while answering. Please try again.";
 const HISTORY_PAGE = 100;
 
@@ -1362,7 +1362,8 @@ export class DotBridge {
 			case "restarting":
 				return "restarting";
 			case "stopped":
-				return "error";
+				// Before the engine was asked to start (the daemon waits for the connectors key), it is starting.
+				return this.supervisor.launched ? "error" : "starting";
 		}
 		if (this.asks.size > 0) return "needs_you";
 		if (!this.supervisor.busy) return "idle";
