@@ -7,6 +7,7 @@ import { WebSocketServer, WebSocket } from 'ws';
 import { createServer, IncomingMessage, Server as HttpServer } from 'http';
 import { URL } from 'url';
 import { EventEmitter } from 'events';
+import { CloseCode } from '@gentle-dot/protocol';
 import { CONNECTOR_TYPES, ConnectorRegistry, type ConnectorInfo, type ConnectorType } from './connector-registry.ts';
 import type { UploadStore } from './uploads.ts';
 import type { AppConfig } from './config-loader.ts';
@@ -115,7 +116,25 @@ interface ConnectionState {
   authenticated: boolean;
 }
 
+/**
+ * The one shared key this server authenticates windows and bridges with. The daemon
+ * generates it at startup and persists it in `<dataDir>/token` (cli.ts); a built-in
+ * default would be a secret published in the source that any local process could use,
+ * so a missing key is an error rather than a fallback (S25.8).
+ */
+export function requireAuthToken(env: NodeJS.ProcessEnv = process.env): string {
+  const token = env['BRIDGE_AUTH_TOKEN'];
+  if (!token) {
+    throw new Error(
+      'BRIDGE_AUTH_TOKEN is not set: the daemon must generate its access key before the WebSocket server starts.',
+    );
+  }
+  return token;
+}
+
 export class WsServer extends EventEmitter {
+  /** Captured once at start, so a later env change cannot move the key mid-life. */
+  private authToken: string | undefined;
   private wss: WebSocketServer | null = null;
   private httpServer: HttpServer | null = null;
   private registry: ConnectorRegistry;
@@ -134,12 +153,41 @@ export class WsServer extends EventEmitter {
    * Start the WebSocket server
    */
   async start(): Promise<void> {
+    // Fail closed before listening: without a key, no client can authenticate.
+    this.authToken = requireAuthToken();
+    // Origins the operator named on top of the desktop app's defaults.
+    const configured = (this.config.daemon as { allowedOrigins?: string[] }).allowedOrigins;
+    for (const origin of configured ?? []) this.allowedOrigins.add(origin);
     return new Promise((resolve, reject) => {
       this.httpServer = createServer((req, res) => {
         this.handleHttpRequest(req, res);
       });
 
-      this.wss = new WebSocketServer({ server: this.httpServer, path: '/ws' });
+      this.wss = new WebSocketServer({ noServer: true, path: '/ws' });
+      const wss = this.wss;
+
+      // WebSocket upgrades are routed here instead of through the HTTP handler, so the origin
+      // veto runs before the handshake: a page the user happens to open must not drive their
+      // assistant. Same-origin windows (the served web UI, a proxied VPS domain) and the
+      // allowlisted desktop origins pass; anything else is refused before upgrading.
+      this.httpServer.on('upgrade', (req, socket, head) => {
+        const url = new URL(req.url ?? '/', 'http://localhost');
+        if (url.pathname !== '/ws') {
+          socket.write('HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n');
+          socket.destroy();
+          return;
+        }
+        const origin = typeof req.headers.origin === 'string' ? req.headers.origin : undefined;
+        const host = typeof req.headers.host === 'string' ? req.headers.host : undefined;
+        const sameOrigin =
+          origin !== undefined && host !== undefined && (origin === `http://${host}` || origin === `https://${host}`);
+        if (origin !== undefined && !sameOrigin && !this.allowedOrigins.has(origin)) {
+          socket.write('HTTP/1.1 403 Forbidden\r\nConnection: close\r\nContent-Type: text/plain\r\n\r\nThat origin is not allowed.');
+          socket.destroy();
+          return;
+        }
+        wss.handleUpgrade(req, socket, head, (ws) => wss.emit('connection', ws, req));
+      });
 
       this.wss.on('connection', (ws: WebSocket, req: IncomingMessage) => {
         this.handleConnection(ws, req);
@@ -207,7 +255,7 @@ export class WsServer extends EventEmitter {
       return;
     }
 
-    if (url.pathname === '/mcp') {
+    if (url.pathname === '/mcp' || url.pathname.startsWith('/mcp/')) {
       this.handleMcp(req, res);
       return;
     }
@@ -292,6 +340,12 @@ export class WsServer extends EventEmitter {
           appClientId = this.handleAppHello(ws, message);
           return;
         }
+        // No session exists yet: the first frame a window sends must be the flat hello, and a
+        // connection that never authenticated cannot keep talking (client protocol, S25.1).
+        if (message.type !== 'hello') {
+          ws.close(CloseCode.unauthorized, 'The first message must be hello');
+          return;
+        }
 
         // Validate message structure
         if (!message.type || typeof message.timestamp !== 'number') {
@@ -339,7 +393,9 @@ export class WsServer extends EventEmitter {
         }
       } catch (error) {
         console.error('[WsServer] Error parsing message:', error);
-        this.sendError(ws, 'PARSE_ERROR', 'Invalid JSON');
+        // A window gets the flat client-protocol error; bridges get the envelope one.
+        if (appClientId) this.sendAppError(ws, 'bad_message', 'Invalid JSON');
+        else this.sendError(ws, 'PARSE_ERROR', 'Invalid JSON');
       }
     };
 
@@ -382,74 +438,9 @@ export class WsServer extends EventEmitter {
       return;
     }
 
-    const chunks: Buffer[] = [];
-    let size = 0;
-    req.on('data', (chunk: Buffer) => {
-      size += chunk.length;
-      // A request larger than this is not something a tool call needs.
-      if (size > 4 * 1024 * 1024) {
-        req.destroy();
-        return;
-      }
-      chunks.push(chunk);
-    });
-    req.on('end', () => {
-      let request: { id?: unknown; method?: string; params?: Record<string, unknown> };
-      try {
-        request = JSON.parse(Buffer.concat(chunks).toString('utf8')) as typeof request;
-      } catch {
-        res.writeHead(400, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ jsonrpc: '2.0', id: null, error: { code: -32700, message: 'Parse error' } }));
-        return;
-      }
-
-      const reply = (body: unknown): void => {
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify(body));
-      };
-      const fail = (code: number, message: string): void =>
-        reply({ jsonrpc: '2.0', id: request.id ?? null, error: { code, message } });
-
-      switch (request.method) {
-        case 'initialize':
-          reply({
-            jsonrpc: '2.0',
-            id: request.id ?? null,
-            result: {
-              protocolVersion: '2024-11-05',
-              capabilities: { tools: {} },
-              serverInfo: { name: 'gentle-dot-connectors', version: '1.0.0' },
-            },
-          });
-          return;
-        case 'notifications/initialized':
-          res.writeHead(202);
-          res.end();
-          return;
-        case 'tools/list':
-          reply({
-            jsonrpc: '2.0',
-            id: request.id ?? null,
-            result: { tools: endpoint.list() },
-          });
-          return;
-        case 'tools/call': {
-          const params = (request.params ?? {}) as { name?: unknown; arguments?: unknown };
-          const name = typeof params.name === 'string' ? params.name : '';
-          const args = typeof params.arguments === 'object' && params.arguments !== null
-            ? (params.arguments as Record<string, unknown>)
-            : {};
-          if (name === '') return fail(-32602, 'A tool name is required');
-          void endpoint
-            .call(name, args)
-            .then((result) => reply({ jsonrpc: '2.0', id: request.id ?? null, result }))
-            .catch((error: Error) => fail(-32603, error.message));
-          return;
-        }
-        default:
-          fail(-32601, `Unknown method: ${String(request.method)}`);
-      }
-    });
+    // The proxy speaks the full MCP protocol over streamable HTTP, per connector: the path
+    // carries the connector id and the proxy owns parsing, listing, calls and approvals.
+    endpoint.handle(req, res);
   }
 
   /**
@@ -538,12 +529,12 @@ export class WsServer extends EventEmitter {
   private handleAppHello(ws: WebSocket, message: { token?: string; protocol?: number }): string | null {
     if (message.protocol !== PROTOCOL_VERSION) {
       this.sendAppError(ws, 'PROTOCOL_MISMATCH', `Expected protocol v${PROTOCOL_VERSION}, got v${message.protocol}`);
-      ws.close(1002, 'Protocol mismatch');
+      ws.close(CloseCode.badProtocol, 'Protocol mismatch');
       return null;
     }
     if (!message.token || message.token !== this.getAuthToken()) {
       this.sendAppError(ws, 'INVALID_TOKEN', 'Invalid authentication token');
-      ws.close(1008, 'Invalid token');
+      ws.close(CloseCode.unauthorized, 'Invalid token');
       return null;
     }
 
@@ -823,8 +814,7 @@ export class WsServer extends EventEmitter {
    */
   mcpEndpoint: {
     key: string;
-    list(): { name: string; description?: string; inputSchema?: unknown }[];
-    call(name: string, args: Record<string, unknown>): Promise<unknown>;
+    handle(req: IncomingMessage, res: import('http').ServerResponse): void;
   } | null = null;
 
   /**
@@ -841,8 +831,9 @@ export class WsServer extends EventEmitter {
   private appSeq = 0;
 
   private getAuthToken(): string {
-    // In production, this should come from a secure config
-    // For now, use a simple shared secret from env or default
-    return process.env['BRIDGE_AUTH_TOKEN'] || 'gentle-dot-bridge-secret';
+    if (this.authToken === undefined) {
+      throw new Error('The WebSocket server has no access key: start() was never called.');
+    }
+    return this.authToken;
   }
 }
